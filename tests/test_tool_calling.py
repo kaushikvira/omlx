@@ -1274,6 +1274,139 @@ class TestParseBracketToolCalls:
         assert cleaned == text
 
 
+class TestParseLfmToolCalls:
+    """Tests for LFM2 / LFM2.5 (Liquid AI) tool call parsing."""
+
+    def _tok(self):
+        # LFM models do not currently expose tool_call_start via mlx-lm's
+        # TokenizerWrapper, so the dispatcher reaches the LFM fallback branch.
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+        return tok
+
+    def test_single_call_string_args(self):
+        from omlx.api.tool_calling import _parse_lfm_tool_calls
+
+        text = (
+            '<|tool_call_start|>[get_weather(location="Tokyo", units="metric")]'
+            '<|tool_call_end|>'
+        )
+        cleaned, tool_calls = _parse_lfm_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "location": "Tokyo",
+            "units": "metric",
+        }
+        assert cleaned == ""
+
+    def test_mixed_value_types(self):
+        from omlx.api.tool_calling import _parse_lfm_tool_calls
+
+        text = (
+            '<|tool_call_start|>[search(q="apples", limit=5, fuzzy=True, '
+            'ratio=0.75, tags=["fresh","red"])]<|tool_call_end|>'
+        )
+        _, tool_calls = _parse_lfm_tool_calls(text)
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {
+            "q": "apples",
+            "limit": 5,
+            "fuzzy": True,
+            "ratio": 0.75,
+            "tags": ["fresh", "red"],
+        }
+
+    def test_multiple_calls_in_one_response(self):
+        from omlx.api.tool_calling import _parse_lfm_tool_calls
+
+        text = (
+            'Sure, calling both:\n'
+            '<|tool_call_start|>[a(x=1)]<|tool_call_end|>'
+            ' and '
+            '<|tool_call_start|>[b(y="hi")]<|tool_call_end|>'
+        )
+        cleaned, tool_calls = _parse_lfm_tool_calls(text)
+        assert tool_calls is not None
+        assert [tc.function.name for tc in tool_calls] == ["a", "b"]
+        assert json.loads(tool_calls[0].function.arguments) == {"x": 1}
+        assert json.loads(tool_calls[1].function.arguments) == {"y": "hi"}
+        assert "<|tool_call_start|>" not in cleaned
+        assert cleaned.startswith("Sure")
+
+    def test_no_args(self):
+        from omlx.api.tool_calling import _parse_lfm_tool_calls
+
+        text = '<|tool_call_start|>[list_models()]<|tool_call_end|>'
+        _, tool_calls = _parse_lfm_tool_calls(text)
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "list_models"
+        assert json.loads(tool_calls[0].function.arguments) == {}
+
+    def test_dotted_function_name(self):
+        from omlx.api.tool_calling import _parse_lfm_tool_calls
+
+        text = '<|tool_call_start|>[fs.read(path="a.txt")]<|tool_call_end|>'
+        _, tool_calls = _parse_lfm_tool_calls(text)
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "fs.read"
+
+    def test_malformed_body_skipped(self):
+        from omlx.api.tool_calling import _parse_lfm_tool_calls
+
+        # Missing brackets around the call body — non-conforming.
+        text = '<|tool_call_start|>get_weather(location="Tokyo")<|tool_call_end|>'
+        cleaned, tool_calls = _parse_lfm_tool_calls(text)
+        assert tool_calls is None
+        assert cleaned == text
+
+    def test_no_marker_returns_passthrough(self):
+        from omlx.api.tool_calling import _parse_lfm_tool_calls
+
+        text = "Just some regular text without tool markers."
+        cleaned, tool_calls = _parse_lfm_tool_calls(text)
+        assert tool_calls is None
+        assert cleaned == text
+
+    def test_dispatch_via_parse_tool_calls(self):
+        """The top-level parse_tool_calls dispatches to LFM parsing when markers
+        are present and the tokenizer does not advertise tool_call_start."""
+        tok = self._tok()
+        text = (
+            'I will help.\n'
+            '<|tool_call_start|>[ping(host="1.1.1.1")]<|tool_call_end|>'
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "ping"
+        assert json.loads(tool_calls[0].function.arguments) == {"host": "1.1.1.1"}
+        assert "<|tool_call_start|>" not in cleaned
+        assert cleaned.startswith("I will help")
+
+    def test_stream_filter_suppresses_lfm_envelope(self):
+        """Streaming filter strips LFM markers without leaking partial markup."""
+        tok = MagicMock(spec=[])
+        tok.tool_call_start = None
+        tok.tool_call_end = None
+
+        f = ToolCallStreamFilter(tok)
+        out = ""
+        out += f.feed("Hello ")
+        out += f.feed("<|tool_call_start|>")
+        out += f.feed('[ping(host="x")]')
+        out += f.feed("<|tool_call_end|>")
+        out += f.feed(" world")
+        out += f.finish()
+        assert "<|tool_call_start|>" not in out
+        assert "<|tool_call_end|>" not in out
+        assert "ping" not in out
+        assert out.startswith("Hello")
+        assert out.endswith("world")
+
+
 class TestParseToolCallsWithThinkingFallback:
     """Tests for parse_tool_calls_with_thinking_fallback.
 

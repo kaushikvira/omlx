@@ -290,6 +290,117 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
 
 
 # ---------------------------------------------------------------------------
+# LFM2 / LFM2.5 (Liquid AI) tool call parser
+# ---------------------------------------------------------------------------
+
+# Markers used by Liquid AI's LFM2 / LFM2.5 family (e.g. LFM2.5-1.2B-Thinking).
+# The model emits Pythonic-style calls between these markers:
+#     <|tool_call_start|>[fn_name(arg1="value1", arg2=2)]<|tool_call_end|>
+# mlx-lm's TokenizerWrapper does not currently register these as tool-call
+# tokens, so neither the native tool_parser dispatch nor the generic
+# <tool_call> XML fallback will fire. We handle this format explicitly.
+_LFM_TOOL_CALL_START = "<|tool_call_start|>"
+_LFM_TOOL_CALL_END = "<|tool_call_end|>"
+
+
+def _parse_lfm_pythonic_args(args_str: str) -> dict:
+    """Parse Pythonic keyword arguments from an LFM2 tool call body.
+
+    Accepts the body between ``(`` and ``)`` in
+    ``[fn_name(arg1="value1", arg2=2)]``. Uses ``ast`` to evaluate literal
+    values safely (no ``eval``).
+    """
+    import ast
+
+    arguments: dict = {}
+    if not args_str.strip():
+        return arguments
+
+    # Wrap in a dummy call to lean on Python's grammar for keyword args.
+    try:
+        tree = ast.parse(f"_f({args_str})", mode="eval")
+    except SyntaxError:
+        # Last-ditch: try parsing as a JSON object {k: v, ...}
+        try:
+            return json.loads("{" + args_str + "}")
+        except (json.JSONDecodeError, ValueError):
+            return {"raw": args_str}
+
+    call = tree.body
+    if not isinstance(call, ast.Call):
+        return {"raw": args_str}
+
+    for kw in call.keywords:
+        if kw.arg is None:
+            continue
+        try:
+            arguments[kw.arg] = ast.literal_eval(kw.value)
+        except (ValueError, SyntaxError):
+            arguments[kw.arg] = ast.unparse(kw.value) if hasattr(ast, "unparse") else None
+    # Positional args are non-conforming for LFM tool calls but capture them
+    # under numeric keys rather than dropping silently, so debugging is easier.
+    for i, pos in enumerate(call.args):
+        try:
+            arguments[f"arg{i}"] = ast.literal_eval(pos)
+        except (ValueError, SyntaxError):
+            arguments[f"arg{i}"] = ast.unparse(pos) if hasattr(ast, "unparse") else None
+    return arguments
+
+
+def _parse_lfm_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+    """Parse Liquid AI LFM2 / LFM2.5 tool calls.
+
+    Format::
+
+        <|tool_call_start|>[fn_name(arg1="value1", arg2=2)]<|tool_call_end|>
+
+    Multiple calls in one response are supported. The call body uses Pythonic
+    keyword-argument syntax — strings double-quoted, numbers/booleans bare.
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None)
+    """
+    if _LFM_TOOL_CALL_START not in text:
+        return text, None
+
+    start_esc = re.escape(_LFM_TOOL_CALL_START)
+    end_esc = re.escape(_LFM_TOOL_CALL_END)
+    envelope_pattern = rf"{start_esc}(.*?){end_esc}"
+    body_pattern = re.compile(r"\[\s*([A-Za-z_][\w.-]*)\s*\((.*)\)\s*\]\s*$", re.DOTALL)
+
+    tool_calls: List[ToolCall] = []
+    for match in re.finditer(envelope_pattern, text, re.DOTALL):
+        body = match.group(1).strip()
+        body_match = body_pattern.match(body)
+        if not body_match:
+            logger.warning(
+                "LFM tool call envelope did not match expected "
+                "`[name(args)]` body; skipping. Body: %r",
+                body[:200],
+            )
+            continue
+        name = body_match.group(1)
+        args_str = body_match.group(2)
+        arguments = _parse_lfm_pythonic_args(args_str)
+        tool_calls.append(
+            ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=name,
+                    arguments=_serialize_tool_call_arguments(arguments),
+                ),
+            )
+        )
+
+    if not tool_calls:
+        return text, None
+
+    cleaned = re.sub(envelope_pattern, "", text, flags=re.DOTALL).strip()
+    return cleaned, tool_calls
+
+
+# ---------------------------------------------------------------------------
 # Gemma 4 robust fallback parser
 # ---------------------------------------------------------------------------
 
@@ -542,6 +653,12 @@ def parse_tool_calls(
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns)
 
+    # Fallback: LFM2 / LFM2.5 (Liquid AI) <|tool_call_start|>[...]<|tool_call_end|>
+    if _LFM_TOOL_CALL_START in cleaned_text:
+        lfm_cleaned, lfm_calls = _parse_lfm_tool_calls(cleaned_text)
+        if lfm_calls:
+            return lfm_cleaned, lfm_calls
+
     # Fallback: bracket tool call formats (from text-formatted history)
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
@@ -699,7 +816,10 @@ class ToolCallStreamFilter:
             marker = ""
         if marker_end is None:
             marker_end = ""
-        self._marker_pairs: List[Tuple[str, str]] = [("<tool_call>", "</tool_call>")]
+        self._marker_pairs: List[Tuple[str, str]] = [
+            ("<tool_call>", "</tool_call>"),
+            (_LFM_TOOL_CALL_START, _LFM_TOOL_CALL_END),
+        ]
         self._suppress_after_markers: List[str] = []
         if marker:
             if marker_end:
