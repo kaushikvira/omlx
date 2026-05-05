@@ -1158,20 +1158,48 @@ class PagedSSDCacheManager(CacheManager):
                     cache_list_meta[f"layer_{i}_tq_value_fields"] = ",".join(vs._fields)
                 else:
                     keys, values = layer_data
-                    if _has_zero_dim(keys):
-                        arrays[f"layer_{i}_keys"] = mx.zeros((1,))
-                        cache_list_meta[f"layer_{i}_keys_zero_dim"] = (
-                            _encode_shape(keys.shape)
-                        )
+
+                    # Handle ArraysCache state: keys/values may be lists of arrays
+                    # (e.g., conv_state=[layer1, layer2, ...], ssm_state=[...])
+                    if isinstance(keys, (list, tuple)):
+                        for idx, k in enumerate(keys):
+                            k_key = f"layer_{i}_keys_{idx}"
+                            if _has_zero_dim(k):
+                                arrays[k_key] = mx.zeros((1,))
+                                cache_list_meta[f"layer_{i}_keys_{idx}_zero_dim"] = (
+                                    _encode_shape(k.shape)
+                                )
+                            else:
+                                arrays[k_key] = k
+                        cache_list_meta[f"layer_{i}_keys_is_list"] = str(len(keys))
                     else:
-                        arrays[f"layer_{i}_keys"] = keys
-                    if _has_zero_dim(values):
-                        arrays[f"layer_{i}_values"] = mx.zeros((1,))
-                        cache_list_meta[f"layer_{i}_values_zero_dim"] = (
-                            _encode_shape(values.shape)
-                        )
+                        if _has_zero_dim(keys):
+                            arrays[f"layer_{i}_keys"] = mx.zeros((1,))
+                            cache_list_meta[f"layer_{i}_keys_zero_dim"] = (
+                                _encode_shape(keys.shape)
+                            )
+                        else:
+                            arrays[f"layer_{i}_keys"] = keys
+
+                    if isinstance(values, (list, tuple)):
+                        for idx, v in enumerate(values):
+                            v_key = f"layer_{i}_values_{idx}"
+                            if _has_zero_dim(v):
+                                arrays[v_key] = mx.zeros((1,))
+                                cache_list_meta[f"layer_{i}_values_{idx}_zero_dim"] = (
+                                    _encode_shape(v.shape)
+                                )
+                            else:
+                                arrays[v_key] = v
+                        cache_list_meta[f"layer_{i}_values_is_list"] = str(len(values))
                     else:
-                        arrays[f"layer_{i}_values"] = values
+                        if _has_zero_dim(values):
+                            arrays[f"layer_{i}_values"] = mx.zeros((1,))
+                            cache_list_meta[f"layer_{i}_values_zero_dim"] = (
+                                _encode_shape(values.shape)
+                            )
+                        else:
+                            arrays[f"layer_{i}_values"] = values
 
             # Prepare metadata
             metadata = {
@@ -1397,18 +1425,54 @@ class PagedSSDCacheManager(CacheManager):
                 keys_key = f"layer_{i}_keys"
                 values_key = f"layer_{i}_values"
 
-                if keys_key not in arrays or values_key not in arrays:
+                if keys_key not in arrays and values_key not in arrays:
                     logger.error(f"Missing keys/values for layer {i}")
                     return None
 
-                keys = arrays[keys_key]
-                values = arrays[values_key]
-                k_zd = f"layer_{i}_keys_zero_dim"
-                v_zd = f"layer_{i}_values_zero_dim"
-                if file_metadata and k_zd in file_metadata:
-                    keys = mx.zeros(_decode_shape(file_metadata[k_zd]))
-                if file_metadata and v_zd in file_metadata:
-                    values = mx.zeros(_decode_shape(file_metadata[v_zd]))
+                # Check if this layer has list-typed keys/values (ArraysCache)
+                keys_is_list = file_metadata and f"layer_{i}_keys_is_list" in file_metadata
+                values_is_list = file_metadata and f"layer_{i}_values_is_list" in file_metadata
+
+                if keys_is_list:
+                    num_keys = int(file_metadata[f"layer_{i}_keys_is_list"])
+                    keys = []
+                    for idx in range(num_keys):
+                        k_key = f"layer_{i}_keys_{idx}"
+                        k_zd = f"layer_{i}_keys_{idx}_zero_dim"
+                        if k_key in arrays:
+                            keys.append(arrays[k_key])
+                        elif file_metadata and k_zd in file_metadata:
+                            keys.append(mx.zeros(_decode_shape(file_metadata[k_zd])))
+                        else:
+                            logger.error(f"Missing keys_{idx} for layer {i}")
+                            return None
+                    keys = tuple(keys)
+                else:
+                    keys = arrays[keys_key]
+                    k_zd = f"layer_{i}_keys_zero_dim"
+                    if file_metadata and k_zd in file_metadata:
+                        keys = mx.zeros(_decode_shape(file_metadata[k_zd]))
+
+                if values_is_list:
+                    num_values = int(file_metadata[f"layer_{i}_values_is_list"])
+                    values = []
+                    for idx in range(num_values):
+                        v_key = f"layer_{i}_values_{idx}"
+                        v_zd = f"layer_{i}_values_{idx}_zero_dim"
+                        if v_key in arrays:
+                            values.append(arrays[v_key])
+                        elif file_metadata and v_zd in file_metadata:
+                            values.append(mx.zeros(_decode_shape(file_metadata[v_zd])))
+                        else:
+                            logger.error(f"Missing values_{idx} for layer {i}")
+                            return None
+                    values = tuple(values)
+                else:
+                    values = arrays[values_key]
+                    v_zd = f"layer_{i}_values_zero_dim"
+                    if file_metadata and v_zd in file_metadata:
+                        values = mx.zeros(_decode_shape(file_metadata[v_zd]))
+
                 cache_data.append((keys, values))
 
         return cache_data
