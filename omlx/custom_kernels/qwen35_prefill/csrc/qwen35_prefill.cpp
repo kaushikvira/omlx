@@ -537,7 +537,7 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
       msg << "Unsupported Qwen affine qmm bits " << bits_ << ".";
       throw std::invalid_argument(msg.str());
     }
-    if (group_size_ != 64 && group_size_ != 128) {
+    if (group_size_ != 32 && group_size_ != 64 && group_size_ != 128) {
       std::ostringstream msg;
       msg << "Unsupported Qwen affine qmm group_size " << group_size_ << ".";
       throw std::invalid_argument(msg.str());
@@ -563,7 +563,7 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
     if (!qwen_q_affine_bits_supported(bits)) {
       return true;
     }
-    if (group_size != 64 && group_size != 128) {
+    if (group_size != 32 && group_size != 64 && group_size != 128) {
       return true;
     }
     if (x.dtype() != float16 && x.dtype() != bfloat16) {
@@ -585,6 +585,11 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
     const auto cfg = qwen_q_affine_variant(variant);
     const int K = x.shape(-1);
     const int N = weight.shape(0);
+    // gs=32 only has BK=32 tiles instantiated (QuantizedBlockLoader requires
+    // group_size % BK == 0 and BK <= group_size).
+    if (group_size == 32 && cfg.bk != 32) {
+      return true;
+    }
     if (K <= 0 || N <= 0 || x.size() <= 0 || K % group_size != 0 ||
         K % cfg.bk != 0 || N % cfg.bn != 0) {
       return true;
@@ -677,11 +682,15 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
 
     const auto cfg = qwen_q_affine_variant(variant_);
     std::string kname;
+    const char* gs_suffix =
+        group_size_ == 128 ? "_affine_qmm128_t_"
+        : group_size_ == 32  ? "_affine_qmm32_t_"
+                            : "_affine_qmm_t_";
     concatenate(
         kname,
         "qwen35_q",
         bits_,
-        group_size_ == 128 ? "_affine_qmm128_t_" : "_affine_qmm_t_",
+        gs_suffix,
         qwen_type_name(x.dtype()),
         "_bm_",
         cfg.bm,
@@ -936,7 +945,7 @@ array qwen35_q_affine_qmm_t(
         << "_affine_qmm_t] unsupported bits.";
     throw std::invalid_argument(msg.str());
   }
-  if (group_size != 64 && group_size != 128) {
+  if (group_size != 32 && group_size != 64 && group_size != 128) {
     std::ostringstream msg;
     msg << "[omlx_qwen35_prefill.qwen35_q" << bits
         << "_affine_qmm_t] unsupported group_size " << group_size << ".";

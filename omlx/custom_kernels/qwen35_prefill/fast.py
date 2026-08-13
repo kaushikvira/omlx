@@ -116,7 +116,7 @@ def qmm_supports_group_size(group_size: int) -> bool:
     group sizes require the rebuilt binding; routing a gs=128 layer through
     an old build would silently run the gs=64 kernel on gs=128 data.
     """
-    return group_size == 64 or _EXT_HAS_QMM_GROUP_SIZE
+    return group_size in (32, 64) or _EXT_HAS_QMM_GROUP_SIZE
 
 _NAX_ARCH_RE = re.compile(r"applegpu_g(\d+)([a-z])")
 _NAX_KERNEL_NEEDLE = b"affine_qmm_t_nax"

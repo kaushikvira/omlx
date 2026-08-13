@@ -65,7 +65,7 @@ def _is_supported_affine_linear_shape(
     if ndim < 2 or seq_len <= 1:
         return False
     group_size = getattr(linear, "group_size", None)
-    if group_size not in (64, 128):
+    if group_size not in (32, 64, 128):
         return False
     if not _qmm_supports_group_size(int(group_size)):
         return False
