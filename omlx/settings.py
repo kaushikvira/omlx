@@ -284,6 +284,11 @@ class SchedulerSettings:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk runs. Off restores the pre-fairness behavior.
     decode_fairness: bool = True
+    # Prefill chunk size (tokens per forward pass). Larger chunks reduce
+    # per-chunk dispatch/graph overhead at the cost of transient memory.
+    # Global across models (shared SchedulerConfig). Default 2048 matches
+    # SchedulerConfig.prefill_step_size.
+    prefill_step_size: int = 2048
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -304,12 +309,22 @@ class SchedulerSettings:
         prefill_priority = data.get("prefill_priority", "context")
         if prefill_priority not in ("context", "speed"):
             prefill_priority = "context"
+        raw_step = data.get("prefill_step_size")
+        prefill_step_size = 2048
+        if raw_step is not None:
+            try:
+                parsed = int(raw_step)
+            except (TypeError, ValueError):
+                parsed = 0
+            if parsed >= 1:
+                prefill_step_size = parsed
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
+            prefill_step_size=prefill_step_size,
         )
 
 
@@ -1531,6 +1546,7 @@ class GlobalSettings:
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
+            prefill_step_size=self.scheduler.prefill_step_size,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
             initial_cache_blocks=self.cache.initial_cache_blocks,
