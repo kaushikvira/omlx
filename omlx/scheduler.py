@@ -1511,6 +1511,7 @@ class SchedulerConfig:
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
+    gdn_sidecar_state_dtype: str = "rht_int16"
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -1608,7 +1609,12 @@ class _BoundarySnapshotProvider:
         if staged_path is None:
             return False
         try:
-            signature = self._paged_ssd_manager.cache_signature_for(
+            signature_builder = getattr(
+                self._paged_ssd_manager, "gdn_cache_signature_for", None
+            )
+            if not callable(signature_builder):
+                signature_builder = self._paged_ssd_manager.cache_signature_for
+            signature = signature_builder(
                 model_name=model_name,
                 num_layers=len(layer_cache_types or []),
                 block_size=block_size,
@@ -5940,6 +5946,26 @@ class Scheduler:
             for layer_cache in cache_list
         )
 
+    def _gdn_split_active(self) -> bool:
+        """Return whether the current cache layout can use GDN sidecars."""
+        if not getattr(self.config, "gdn_ssd_split_enabled", False):
+            return False
+        if (
+            self.block_aware_cache is None
+            or self.paged_ssd_cache_manager is None
+            or self._boundary_snapshot_store is None
+        ):
+            return False
+        layer_types = getattr(
+            self.paged_ssd_cache_manager,
+            "_expected_layer_cache_types",
+            None,
+        )
+        supported = getattr(
+            self.block_aware_cache, "_gdn_split_layout_supported", None
+        )
+        return bool(callable(supported) and supported(layer_types))
+
     def _eval_snapshot_cache(self, snapshot_cache: list[Any]) -> None:
         """Force the leaf KV tensors of an in-memory boundary snapshot concrete.
 
@@ -7605,6 +7631,29 @@ class Scheduler:
                 extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             )
+            # A split GDN sidecar represents state at a full block boundary.
+            # Exact-hit generation needs N-1 state, which Arrays/GDN cannot
+            # produce by trimming one token. Re-prefill only the final block.
+            if (
+                self._gdn_split_active()
+                and block_table is not None
+                and block_table.block_ids
+                and block_table.num_tokens >= len(request.prompt_token_ids)
+                and self.paged_cache_manager is not None
+            ):
+                last_block_id = block_table.block_ids.pop()
+                last_block = self.paged_cache_manager.allocated_blocks.get(
+                    last_block_id
+                )
+                last_token_count = (
+                    last_block.token_count
+                    if last_block is not None and last_block.token_count > 0
+                    else self.config.paged_cache_block_size
+                )
+                block_table.num_tokens = max(
+                    0, block_table.num_tokens - last_token_count
+                )
+                self.paged_cache_manager.free_block(last_block_id)
             if block_table and block_table.num_tokens > 0:
                 bypass_hot_cache = self._bypass_hot_cache_under_pressure()
                 if bypass_hot_cache:
@@ -11874,13 +11923,29 @@ class Scheduler:
                 num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
                 head_dim = hidden_size // num_heads
 
+            # Determine the activation dtype from an explicit model property or,
+            # for mlx-lm text models (including DeepSeek V4), the embedding
+            # weight that produces the hidden-state stream. ``mx.Dtype`` cannot
+            # be compared with ``None`` safely, so keep matching guarded.
+            model_dtype = getattr(self.model, "dtype", None)
+            if model_dtype is None:
+                model_body = getattr(self.model, "model", None)
+                embed_tokens = getattr(model_body, "embed_tokens", None)
+                embed_weight = getattr(embed_tokens, "weight", None)
+                model_dtype = getattr(embed_weight, "dtype", None)
+
+            def _dtype_matches(dtype: Any, expected: Any) -> bool:
+                if dtype is None:
+                    return False
+                try:
+                    return bool(dtype == expected)
+                except (TypeError, ValueError):
+                    return False
+
             # Determine base dtype size for uncompressed KV cache elements.
             base_dtype_size: float = 2  # Default float16/bfloat16
-            if hasattr(self.model, "dtype"):
-                if self.model.dtype == mx.float32:
-                    base_dtype_size = 4
-                elif self.model.dtype == mx.bfloat16:
-                    base_dtype_size = 2
+            if _dtype_matches(model_dtype, mx.float32):
+                base_dtype_size = 4
             dtype_size = base_dtype_size
 
             # Extract num_attention_heads (query heads) for SDPA peak estimation
@@ -11961,6 +12026,7 @@ class Scheduler:
                 make_prefill_memory_profile(
                     config,
                     compute_dtype_size=base_dtype_size,
+                    wsdpa_dtype_supported=_dtype_matches(model_dtype, mx.bfloat16),
                 )
                 if make_prefill_memory_profile is not None
                 else None
@@ -12229,6 +12295,7 @@ class Scheduler:
                 expected_block_size=self.config.paged_cache_block_size,
                 expected_block_size_tokens=self.config.paged_cache_block_size,
                 expected_kv_bytes_per_token=expected_kv_bytes_per_token,
+                gdn_sidecar_state_dtype=self.config.gdn_sidecar_state_dtype,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager
@@ -12251,10 +12318,18 @@ class Scheduler:
                     self._boundary_snapshot_store = BoundarySnapshotSSDStore(
                         base_dir=Path(self.config.paged_ssd_cache_dir),
                         pending_max_bytes=self.config.gdn_ssd_pending_max_bytes,
+                        gdn_sidecar_state_dtype=(
+                            self.config.gdn_sidecar_state_dtype
+                            if self.config.gdn_ssd_split_enabled
+                            else "fp32"
+                        ),
                     )
                     if self.block_aware_cache is not None:
                         self.block_aware_cache.set_gdn_checkpoint_loader(
-                            self._boundary_snapshot_store.load_file
+                            self._boundary_snapshot_store.load_file,
+                            dequantization_counter=lambda: (
+                                self._boundary_snapshot_store.gdn_state_dequantizations
+                            ),
                         )
                 except Exception as e:
                     logger.debug(
@@ -12536,6 +12611,45 @@ class Scheduler:
         if self.paged_cache_manager is not None:
             stats["indexed_blocks"] = self.paged_cache_manager.cold_block_count
             stats["block_size"] = self.config.paged_cache_block_size
+
+        if self._boundary_snapshot_store is not None:
+            stats["gdn_staging"] = {
+                "pending_bytes": self._boundary_snapshot_store.pending_bytes,
+                "pending_peak_bytes": (
+                    self._boundary_snapshot_store.pending_peak_bytes
+                ),
+                "backpressure_ms": self._boundary_snapshot_store.backpressure_ms,
+                "state_dtype": (
+                    self._boundary_snapshot_store.gdn_sidecar_state_dtype
+                ),
+                "state_dequantizations": (
+                    self._boundary_snapshot_store.gdn_state_dequantizations
+                ),
+                "encode_failures": (
+                    self._boundary_snapshot_store.gdn_encode_failures
+                ),
+                "decode_failures": (
+                    self._boundary_snapshot_store.gdn_decode_failures
+                ),
+                "capability_fallbacks": (
+                    self._boundary_snapshot_store.gdn_capability_fallbacks
+                ),
+                "legacy_fp32_fallbacks": (
+                    self.paged_ssd_cache_manager.gdn_legacy_fp32_fallbacks
+                    if self.paged_ssd_cache_manager is not None
+                    else 0
+                ),
+                "sidecar_count": (
+                    self.paged_ssd_cache_manager.gdn_sidecar_count
+                    if self.paged_ssd_cache_manager is not None
+                    else 0
+                ),
+                "sidecar_size_bytes": (
+                    self.paged_ssd_cache_manager.gdn_sidecar_size_bytes
+                    if self.paged_ssd_cache_manager is not None
+                    else 0
+                ),
+            }
 
         if self.block_aware_cache is not None:
             prefix_stats = self.block_aware_cache.get_stats_dict()
